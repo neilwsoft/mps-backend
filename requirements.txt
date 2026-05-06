@@ -1,0 +1,9 @@
+fastapi[standard]>=0.115
+sympy>=1.13
+antlr4-python3-runtime==4.11
+google-genai>=0.3
+python-dotenv>=1.0
+passlib[bcrypt]>=1.7.4
+bcrypt<4.0  # passlib 1.7 can't introspect the version on bcrypt>=4 (harmless warning otherwise)
+pyjwt>=2.9.0
+email-validator>=2.2.0
