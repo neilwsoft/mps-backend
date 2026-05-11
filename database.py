@@ -26,6 +26,7 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
 
+from migrations import run_migrations
 from questions import QUESTIONS
 
 DB_PATH = os.getenv("DATABASE_PATH", "./mps.db")
@@ -116,6 +117,7 @@ def init_db() -> None:
         for stmt in LEGACY_DROPS:
             conn.execute(stmt)
         conn.executescript(SCHEMA)
+        run_migrations(conn)
 
         admin = conn.execute(
             "SELECT id FROM users WHERE email = ?", (admin_email,)
@@ -320,16 +322,30 @@ def get_submission(submission_id: int) -> dict | None:
             """
             SELECT sl.id, sl.question_id, sl.line_index, sl.submitted_latex,
                    sl.correct, sl.explanation, sl.created_at,
+                   sl.partial_score, sl.time_spent_ms, sl.source, sl.ocr_confidence,
+                   sl.override_correct, sl.override_reason, sl.override_at,
+                   ou.name AS override_by_name,
                    eq.position AS question_position,
                    eq.prompt_latex AS question_prompt
             FROM submission_lines sl
             JOIN exam_questions eq ON eq.id = sl.question_id
+            LEFT JOIN users ou ON ou.id = sl.override_by
             WHERE sl.submission_id = ?
             ORDER BY eq.position, sl.line_index, sl.id
             """,
             (submission_id,),
         ).fetchall()
-    return {**dict(sub), "lines": [dict(r) for r in lines]}
+        hints = conn.execute(
+            """SELECT question_id, line_index, hint_text, created_at
+               FROM hints_used WHERE submission_id = ?
+               ORDER BY created_at""",
+            (submission_id,),
+        ).fetchall()
+    return {
+        **dict(sub),
+        "lines": [dict(r) for r in lines],
+        "hints": [dict(r) for r in hints],
+    }
 
 
 def record_submission_line(
@@ -339,12 +355,17 @@ def record_submission_line(
     submitted_latex: str,
     correct: bool,
     explanation: str | None,
+    partial_score: float = 0.0,
+    time_spent_ms: int | None = None,
+    source: str = "typed",
+    ocr_confidence: float | None = None,
 ) -> int:
     with connect() as conn:
         cur = conn.execute(
             "INSERT INTO submission_lines "
-            "(submission_id, question_id, line_index, submitted_latex, correct, explanation) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(submission_id, question_id, line_index, submitted_latex, correct, "
+            " explanation, partial_score, time_spent_ms, source, ocr_confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 submission_id,
                 question_id,
@@ -352,35 +373,69 @@ def record_submission_line(
                 submitted_latex,
                 int(correct),
                 explanation,
+                float(partial_score),
+                time_spent_ms,
+                source,
+                ocr_confidence,
             ),
         )
         return int(cur.lastrowid)
 
 
-def finalize_submission(submission_id: int) -> dict:
-    """Compute score from recorded lines and stamp submitted_at.
-
-    Score = number of correct lines. Total = expected total lines across
-    all exam questions (so partial submissions are penalised — the
-    student got 0 for the lines they didn't attempt).
+def _compute_score(conn: sqlite3.Connection, submission_id: int) -> tuple[int, int]:
+    """Return (score, total_expected). Score honors overrides and partial credit:
+      - if override_correct is set, that takes precedence (1 → full point, 0 → no points)
+      - else use partial_score (0.0..1.0)
+    Hints used cost 1 point each (capped at score). Score is rounded to nearest int.
     """
+    sub = conn.execute(
+        "SELECT exam_id FROM submissions WHERE id = ?", (submission_id,)
+    ).fetchone()
+    if sub is None:
+        raise ValueError(f"submission {submission_id} not found")
+    questions = conn.execute(
+        "SELECT solution_latex FROM exam_questions WHERE exam_id = ?",
+        (sub["exam_id"],),
+    ).fetchall()
+    total_expected = sum(len(json.loads(q["solution_latex"])) for q in questions)
+
+    raw = conn.execute(
+        """SELECT
+             COALESCE(
+               CASE WHEN override_correct IS NULL THEN NULL ELSE override_correct * 1.0 END,
+               partial_score
+             ) AS pts
+           FROM submission_lines
+           WHERE submission_id = ?""",
+        (submission_id,),
+    ).fetchall()
+    raw_score = sum(float(r["pts"]) for r in raw)
+
+    hint_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM hints_used WHERE submission_id = ?",
+        (submission_id,),
+    ).fetchone()["n"]
+
+    final = max(0, round(raw_score - int(hint_count)))
+    return min(final, total_expected), total_expected
+
+
+def recompute_score(submission_id: int) -> dict:
+    """Recompute score for a (possibly already finalized) submission. Used
+    after grade overrides."""
     with connect() as conn:
-        sub = conn.execute(
-            "SELECT exam_id FROM submissions WHERE id = ?", (submission_id,)
-        ).fetchone()
-        if sub is None:
-            raise ValueError(f"submission {submission_id} not found")
-        questions = conn.execute(
-            "SELECT solution_latex FROM exam_questions WHERE exam_id = ?",
-            (sub["exam_id"],),
-        ).fetchall()
-        total_expected = sum(len(json.loads(q["solution_latex"])) for q in questions)
-        correct_row = conn.execute(
-            "SELECT COUNT(*) AS n FROM submission_lines "
-            "WHERE submission_id = ? AND correct = 1",
-            (submission_id,),
-        ).fetchone()
-        score = int(correct_row["n"])
+        score, total = _compute_score(conn, submission_id)
+        conn.execute(
+            "UPDATE submissions SET score = ?, total = ? WHERE id = ?",
+            (score, total, submission_id),
+        )
+    return {"score": score, "total": total}
+
+
+def finalize_submission(submission_id: int) -> dict:
+    """Compute score from recorded lines and stamp submitted_at."""
+    with connect() as conn:
+        score, total_expected = _compute_score(conn, submission_id)
         conn.execute(
             "UPDATE submissions SET submitted_at = datetime('now'), score = ?, total = ? "
             "WHERE id = ?",
@@ -420,6 +475,358 @@ def list_all_submissions() -> list[dict]:
             """
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def record_hint(
+    submission_id: int, question_id: int, line_index: int, hint_text: str
+) -> int:
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO hints_used (submission_id, question_id, line_index, hint_text) "
+            "VALUES (?, ?, ?, ?)",
+            (submission_id, question_id, line_index, hint_text),
+        )
+        return int(cur.lastrowid)
+
+
+def count_hints(submission_id: int, question_id: int, line_index: int) -> int:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM hints_used "
+            "WHERE submission_id = ? AND question_id = ? AND line_index = ?",
+            (submission_id, question_id, line_index),
+        ).fetchone()
+    return int(row["n"])
+
+
+def get_prior_lines(submission_id: int, question_id: int, line_index: int) -> list[str]:
+    """Lines the student already submitted for this question, in order."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT submitted_latex FROM submission_lines
+               WHERE submission_id = ? AND question_id = ? AND line_index < ?
+               ORDER BY line_index, id""",
+            (submission_id, question_id, line_index),
+        ).fetchall()
+    return [r["submitted_latex"] for r in rows]
+
+
+# ----- scratchpad ---------------------------------------------------------
+
+
+def upsert_scratchpad(submission_id: int, question_id: int, content: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO scratchpad (submission_id, question_id, content)
+               VALUES (?, ?, ?)
+               ON CONFLICT(submission_id, question_id)
+               DO UPDATE SET content = excluded.content, updated_at = datetime('now')""",
+            (submission_id, question_id, content),
+        )
+
+
+def get_scratchpad(submission_id: int, question_id: int) -> str:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT content FROM scratchpad WHERE submission_id = ? AND question_id = ?",
+            (submission_id, question_id),
+        ).fetchone()
+    return row["content"] if row else ""
+
+
+# ----- grade overrides ----------------------------------------------------
+
+
+def override_submission_line(
+    line_id: int, override_correct: bool, reason: str, admin_user_id: int
+) -> dict | None:
+    with connect() as conn:
+        cur = conn.execute(
+            """UPDATE submission_lines
+               SET override_correct = ?, override_reason = ?,
+                   override_by = ?, override_at = datetime('now')
+               WHERE id = ?""",
+            (int(override_correct), reason, admin_user_id, line_id),
+        )
+        if cur.rowcount == 0:
+            return None
+        row = conn.execute(
+            "SELECT submission_id FROM submission_lines WHERE id = ?", (line_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    return recompute_score(row["submission_id"])
+
+
+# ----- exam clone ---------------------------------------------------------
+
+
+def clone_exam(source_exam_id: int, created_by: int, title_suffix: str = " (copy)") -> int | None:
+    with connect() as conn:
+        src = conn.execute(
+            "SELECT title, description FROM exams WHERE id = ?",
+            (source_exam_id,),
+        ).fetchone()
+        if src is None:
+            return None
+        cur = conn.execute(
+            "INSERT INTO exams (title, description, created_by, cloned_from_id) "
+            "VALUES (?, ?, ?, ?)",
+            (src["title"] + title_suffix, src["description"], created_by, source_exam_id),
+        )
+        new_exam_id = int(cur.lastrowid)
+        for q in conn.execute(
+            "SELECT position, prompt_latex, solution_latex FROM exam_questions "
+            "WHERE exam_id = ? ORDER BY position",
+            (source_exam_id,),
+        ).fetchall():
+            conn.execute(
+                "INSERT INTO exam_questions (exam_id, position, prompt_latex, solution_latex) "
+                "VALUES (?, ?, ?, ?)",
+                (new_exam_id, q["position"], q["prompt_latex"], q["solution_latex"]),
+            )
+    return new_exam_id
+
+
+# ----- topics -------------------------------------------------------------
+
+
+def list_topics() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute("SELECT id, name FROM topics ORDER BY name").fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_topic(name: str) -> int:
+    name = name.strip()
+    if not name:
+        raise ValueError("topic name required")
+    with connect() as conn:
+        existing = conn.execute("SELECT id FROM topics WHERE name = ?", (name,)).fetchone()
+        if existing:
+            return int(existing["id"])
+        cur = conn.execute("INSERT INTO topics (name) VALUES (?)", (name,))
+        return int(cur.lastrowid)
+
+
+def set_question_topics(question_id: int, topic_names: list[str]) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM question_topics WHERE question_id = ?", (question_id,))
+        for raw in topic_names:
+            name = raw.strip()
+            if not name:
+                continue
+            existing = conn.execute("SELECT id FROM topics WHERE name = ?", (name,)).fetchone()
+            if existing:
+                tid = existing["id"]
+            else:
+                cur = conn.execute("INSERT INTO topics (name) VALUES (?)", (name,))
+                tid = cur.lastrowid
+            conn.execute(
+                "INSERT OR IGNORE INTO question_topics (question_id, topic_id) VALUES (?, ?)",
+                (question_id, tid),
+            )
+
+
+def get_question_topics(question_id: int) -> list[str]:
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT t.name FROM topics t
+               JOIN question_topics qt ON qt.topic_id = t.id
+               WHERE qt.question_id = ? ORDER BY t.name""",
+            (question_id,),
+        ).fetchall()
+    return [r["name"] for r in rows]
+
+
+# ----- analytics ----------------------------------------------------------
+
+
+def question_metrics(exam_id: int) -> list[dict]:
+    """Per-question metrics: pct correct, mean time, attempt count, discrimination."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT eq.id AS question_id, eq.position, eq.prompt_latex,
+                      COUNT(sl.id) AS attempts,
+                      SUM(sl.correct) AS correct_count,
+                      AVG(sl.time_spent_ms) AS avg_ms
+               FROM exam_questions eq
+               LEFT JOIN submission_lines sl ON sl.question_id = eq.id
+               WHERE eq.exam_id = ?
+               GROUP BY eq.id
+               ORDER BY eq.position""",
+            (exam_id,),
+        ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        attempts = int(r["attempts"] or 0)
+        correct = int(r["correct_count"] or 0)
+        out.append(
+            {
+                "question_id": r["question_id"],
+                "position": r["position"],
+                "prompt_latex": r["prompt_latex"],
+                "attempts": attempts,
+                "pct_correct": (correct / attempts) if attempts else 0.0,
+                "avg_seconds": ((r["avg_ms"] or 0) / 1000.0) if r["avg_ms"] else None,
+            }
+        )
+    return out
+
+
+def student_analytics(user_id: int) -> dict:
+    """Rich per-student analytics: summary, per-exam, per-topic, per-question,
+    hints, total time spent. Used by the admin student-detail page."""
+    with connect() as conn:
+        student = conn.execute(
+            "SELECT id, name, email, created_at FROM users WHERE id = ? AND role = 'student'",
+            (user_id,),
+        ).fetchone()
+        if student is None:
+            return {}
+        per_exam = conn.execute(
+            """SELECT s.id AS submission_id, s.exam_id, e.title AS exam_title,
+                      s.started_at, s.submitted_at, s.score, s.total,
+                      (SELECT COUNT(*) FROM submission_lines sl
+                       WHERE sl.submission_id = s.id) AS line_count,
+                      (SELECT SUM(sl.time_spent_ms) FROM submission_lines sl
+                       WHERE sl.submission_id = s.id) AS total_time_ms,
+                      (SELECT COUNT(*) FROM hints_used h
+                       WHERE h.submission_id = s.id) AS hints_used
+               FROM submissions s
+               JOIN exams e ON e.id = s.exam_id
+               WHERE s.user_id = ?
+               ORDER BY s.started_at""",
+            (user_id,),
+        ).fetchall()
+        per_topic = conn.execute(
+            """SELECT t.name AS topic,
+                      COUNT(sl.id) AS attempts,
+                      SUM(sl.correct) AS correct_count
+               FROM topics t
+               JOIN question_topics qt ON qt.topic_id = t.id
+               JOIN submission_lines sl ON sl.question_id = qt.question_id
+               JOIN submissions s ON s.id = sl.submission_id
+               WHERE s.user_id = ?
+               GROUP BY t.id
+               ORDER BY t.name""",
+            (user_id,),
+        ).fetchall()
+        per_question = conn.execute(
+            """SELECT eq.id AS question_id, eq.prompt_latex,
+                      e.title AS exam_title,
+                      COUNT(sl.id) AS attempts,
+                      SUM(sl.correct) AS correct_count,
+                      AVG(sl.time_spent_ms) AS avg_ms
+               FROM exam_questions eq
+               JOIN submission_lines sl ON sl.question_id = eq.id
+               JOIN submissions s ON s.id = sl.submission_id
+               JOIN exams e ON e.id = eq.exam_id
+               WHERE s.user_id = ?
+               GROUP BY eq.id
+               ORDER BY e.title, eq.position""",
+            (user_id,),
+        ).fetchall()
+
+    exams_out: list[dict] = []
+    for r in per_exam:
+        total = int(r["total"] or 0)
+        score = int(r["score"] or 0)
+        exams_out.append(
+            {
+                "submission_id": r["submission_id"],
+                "exam_id": r["exam_id"],
+                "exam_title": r["exam_title"],
+                "started_at": r["started_at"],
+                "submitted_at": r["submitted_at"],
+                "score": score,
+                "total": total,
+                "accuracy": (score / total) if total else None,
+                "line_count": int(r["line_count"] or 0),
+                "total_time_ms": int(r["total_time_ms"] or 0),
+                "hints_used": int(r["hints_used"] or 0),
+            }
+        )
+    topics_out = [
+        {
+            "topic": r["topic"],
+            "attempts": int(r["attempts"]),
+            "correct": int(r["correct_count"] or 0),
+            "accuracy": (int(r["correct_count"] or 0) / int(r["attempts"]))
+            if r["attempts"]
+            else 0.0,
+        }
+        for r in per_topic
+    ]
+    questions_out = [
+        {
+            "question_id": r["question_id"],
+            "prompt_latex": r["prompt_latex"],
+            "exam_title": r["exam_title"],
+            "attempts": int(r["attempts"]),
+            "correct": int(r["correct_count"] or 0),
+            "accuracy": (int(r["correct_count"] or 0) / int(r["attempts"]))
+            if r["attempts"]
+            else 0.0,
+            "avg_seconds": (r["avg_ms"] / 1000.0) if r["avg_ms"] else None,
+        }
+        for r in per_question
+    ]
+    total_attempts = sum(q["attempts"] for q in questions_out)
+    total_correct = sum(q["correct"] for q in questions_out)
+    total_time = sum(e["total_time_ms"] for e in exams_out)
+    total_hints = sum(e["hints_used"] for e in exams_out)
+    return {
+        "student": dict(student),
+        "summary": {
+            "exams_attempted": len(exams_out),
+            "exams_finalized": sum(1 for e in exams_out if e["submitted_at"]),
+            "total_attempts": total_attempts,
+            "total_correct": total_correct,
+            "accuracy": (total_correct / total_attempts) if total_attempts else 0.0,
+            "total_time_ms": total_time,
+            "hints_used": total_hints,
+        },
+        "exams": exams_out,
+        "topics": topics_out,
+        "questions": questions_out,
+    }
+
+
+def topic_mastery() -> list[dict]:
+    """Per (student, topic) accuracy across all submissions."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT u.id AS student_id, u.name AS student_name,
+                      t.id AS topic_id, t.name AS topic,
+                      COUNT(sl.id) AS attempts,
+                      SUM(sl.correct) AS correct_count
+               FROM users u
+               JOIN submissions s ON s.user_id = u.id
+               JOIN submission_lines sl ON sl.submission_id = s.id
+               JOIN question_topics qt ON qt.question_id = sl.question_id
+               JOIN topics t ON t.id = qt.topic_id
+               WHERE u.role = 'student'
+               GROUP BY u.id, t.id
+               ORDER BY u.name, t.name"""
+        ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        attempts = int(r["attempts"])
+        correct = int(r["correct_count"] or 0)
+        out.append(
+            {
+                "student_id": r["student_id"],
+                "student_name": r["student_name"],
+                "topic": r["topic"],
+                "attempts": attempts,
+                "accuracy": (correct / attempts) if attempts else 0.0,
+            }
+        )
+    return out
+
+
+# ----- legacy --------------------------------------------------------------
 
 
 def list_submissions_for_exam(exam_id: int) -> list[dict]:
