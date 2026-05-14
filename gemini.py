@@ -66,7 +66,7 @@ worksheet expects. Output only the sentences, nothing else.
 {lang}"""
 
 
-_EXTRACT_PROMPT = """You are an OCR system specialised in handwritten K-12 algebra.
+_EXTRACT_PROMPT = """You are a fast OCR system for handwritten K-12 algebra. Be terse and accurate.
 
 The student is solving this problem:
   Problem (LaTeX): {problem}
@@ -124,7 +124,10 @@ def _gemini_text(prompt: str) -> str | None:
     except ImportError:
         logger.warning("google-genai not installed; skipping Gemini call")
         return None
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    # Default to flash-lite across the board — lower latency, sufficient for
+    # short K-12 explanations and hints. Override per call site with
+    # GEMINI_MODEL if a heavier model is needed.
+    model = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
     try:
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(model=model, contents=prompt)
@@ -248,7 +251,7 @@ def generate_question_variants(
         from google import genai
     except ImportError:
         return []
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
     sol = "\n".join(f"  {i + 1}. {s}" for i, s in enumerate(seed_solution))
     prompt = _GENERATE_VARIANT_PROMPT.format(
         n=n,
@@ -317,7 +320,10 @@ def extract_handwritten_math(
         logger.warning("google-genai not installed; cannot extract handwritten math")
         return []
 
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    # OCR doesn't need the full Flash model — Flash-Lite is faster and cheaper
+    # and handles short handwritten LaTeX lines well. Override with
+    # GEMINI_OCR_MODEL if needed.
+    model = os.getenv("GEMINI_OCR_MODEL", "gemini-flash-lite-latest")
     solution_hint = "\n".join(f"  {i + 1}. {s}" for i, s in enumerate(solution_latex))
     prompt = _EXTRACT_PROMPT.format(
         problem=problem_latex,

@@ -399,17 +399,21 @@ def _compute_score(conn: sqlite3.Connection, submission_id: int) -> tuple[int, i
     ).fetchall()
     total_expected = sum(len(json.loads(q["solution_latex"])) for q in questions)
 
+    # Take the BEST attempt per (question_id, line_index) so retries don't
+    # penalize a student who got it wrong, cleared, and got it right.
     raw = conn.execute(
-        """SELECT
+        """SELECT MAX(
              COALESCE(
                CASE WHEN override_correct IS NULL THEN NULL ELSE override_correct * 1.0 END,
                partial_score
-             ) AS pts
+             )
+           ) AS pts
            FROM submission_lines
-           WHERE submission_id = ?""",
+           WHERE submission_id = ?
+           GROUP BY question_id, line_index""",
         (submission_id,),
     ).fetchall()
-    raw_score = sum(float(r["pts"]) for r in raw)
+    raw_score = sum(float(r["pts"] or 0) for r in raw)
 
     hint_count = conn.execute(
         "SELECT COUNT(*) AS n FROM hints_used WHERE submission_id = ?",
@@ -475,6 +479,34 @@ def list_all_submissions() -> list[dict]:
             """
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_submission_line(line_id: int) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT sl.id, sl.submission_id, sl.question_id, sl.line_index,
+                      sl.submitted_latex, sl.correct, sl.explanation,
+                      s.user_id, eq.prompt_latex, eq.solution_latex
+               FROM submission_lines sl
+               JOIN submissions s ON s.id = sl.submission_id
+               JOIN exam_questions eq ON eq.id = sl.question_id
+               WHERE sl.id = ?""",
+            (line_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        **dict(row),
+        "solution_latex": json.loads(row["solution_latex"]),
+    }
+
+
+def update_line_explanation(line_id: int, explanation: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE submission_lines SET explanation = ? WHERE id = ?",
+            (explanation, line_id),
+        )
 
 
 def record_hint(

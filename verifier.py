@@ -18,8 +18,6 @@ from dataclasses import dataclass
 import sympy
 from sympy.parsing.latex import parse_latex
 
-import gemini as gemini_client
-
 
 @dataclass
 class VerifyResult:
@@ -143,6 +141,10 @@ def verify_line(
     total_lines: int,
     locale: str = "en",
 ) -> VerifyResult:
+    """Synchronous fast path — NEVER calls Gemini. The verdict + deterministic
+    baseline explanation come back in under ~200 ms so the student gets
+    instant feedback. A richer tutor-style explanation is fetched separately
+    via POST /api/submission-lines/{id}/explain when the student is wrong."""
     is_final = line_index == total_lines - 1
 
     if _normalize(submitted_latex) == _normalize(expected_latex):
@@ -150,16 +152,9 @@ def verify_line(
             correct=True, explanation=None, is_final=is_final, partial_score=1.0
         )
 
-    ai_msg = gemini_client.explain_mistake_detailed(
-        problem=problem_latex,
-        expected=expected_latex,
-        submitted=submitted_latex,
-        locale=locale,
-    )
-    explanation = ai_msg or _baseline_explanation(
+    explanation = _baseline_explanation(
         submitted_latex, expected_latex, problem_latex, locale=locale
     )
-
     partial = 0.5 if _value_equivalent(submitted_latex, expected_latex) else 0.0
     return VerifyResult(
         correct=False,

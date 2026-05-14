@@ -106,6 +106,18 @@ class SubmitLineResponse(BaseModel):
     is_final_for_question: bool
     expected_total_lines: int
     partial_score: float
+    # The DB row id for this attempt. Used by the frontend to fetch a richer
+    # Gemini-generated explanation via /api/submission-lines/{id}/explain
+    # after the verdict has already been shown to the student.
+    line_id: int
+
+
+class ExplainLineRequest(BaseModel):
+    locale: str = Field(default="en", pattern="^(en|ko)$")
+
+
+class ExplainLineResponse(BaseModel):
+    explanation: str
 
 
 class HintRequest(BaseModel):
@@ -305,7 +317,7 @@ def submit_line(
         locale=req.locale,
     )
 
-    database.record_submission_line(
+    line_id = database.record_submission_line(
         submission_id=submission_id,
         question_id=question["id"],
         line_index=req.line_index,
@@ -324,6 +336,7 @@ def submit_line(
         is_final_for_question=req.line_index == total - 1,
         expected_total_lines=total,
         partial_score=result.partial_score,
+        line_id=line_id,
     )
 
 
@@ -388,23 +401,34 @@ async def extract_handwriting(
     if len(data) > _MAX_IMAGE_BYTES:
         raise HTTPException(status_code=413, detail="image too large (max 8MB)")
 
+    if not gemini_client.gemini_is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Handwriting recognition isn't configured on the server. "
+                "Please contact an administrator."
+            ),
+        )
+
     lines = gemini_client.extract_handwritten_math(
         image_bytes=data,
         mime_type=mime,
         problem_latex=question["prompt_latex"],
         solution_latex=question["solution_latex"],
     )
-    if lines and _normalize(lines[0]["latex"]) == _normalize(question["prompt_latex"]):
+    # Drop a leading line that just restates the problem — but only when
+    # there's another line after it. If the student wrote nothing but the
+    # problem, keep that line so the verifier can tell them "this is still
+    # the problem, do the next step."
+    if (
+        len(lines) > 1
+        and _normalize(lines[0]["latex"]) == _normalize(question["prompt_latex"])
+    ):
         lines = lines[1:]
 
-    if not lines:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Could not read any math lines from the image. "
-                "Make sure GEMINI_API_KEY is set and the photo is well-lit."
-            ),
-        )
+    # No lines is a legitimate result (illegible handwriting, etc.), not a
+    # server error — return an empty list and let the frontend show a clean
+    # localized message that doesn't blame "the photo".
     return ExtractHandwritingResponse(
         lines=[ExtractedLine(latex=line["latex"], confidence=line["confidence"]) for line in lines]
     )
@@ -452,6 +476,44 @@ def admin_exam_submissions(
         "exam": {"id": exam["id"], "title": exam["title"]},
         "submissions": database.list_submissions_for_exam(exam_id),
     }
+
+
+# --- async explanation ---------------------------------------------------
+
+
+@app.post(
+    "/api/submission-lines/{line_id}/explain",
+    response_model=ExplainLineResponse,
+)
+def explain_line(
+    line_id: int,
+    req: ExplainLineRequest,
+    user: dict = Depends(auth.current_user),
+) -> ExplainLineResponse:
+    """Fetch a richer, tutor-style explanation for a previously-recorded
+    wrong submission line. The fast-path verifier doesn't call Gemini so the
+    student gets a verdict instantly; this endpoint adds the personalized
+    explanation in the background."""
+    line = database.get_submission_line(line_id)
+    if line is None:
+        raise HTTPException(status_code=404, detail="line not found")
+    if user["role"] != "admin" and line["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="not your submission line")
+    if line["correct"]:
+        # Nothing to explain — the student got it right.
+        return ExplainLineResponse(explanation=line["explanation"] or "")
+
+    expected = line["solution_latex"][line["line_index"]]
+    rich = gemini_client.explain_mistake_detailed(
+        problem=line["prompt_latex"],
+        expected=expected,
+        submitted=line["submitted_latex"],
+        locale=req.locale,
+    )
+    explanation = rich or (line["explanation"] or "")
+    if rich:
+        database.update_line_explanation(line_id, rich)
+    return ExplainLineResponse(explanation=explanation)
 
 
 # --- hints ----------------------------------------------------------------
